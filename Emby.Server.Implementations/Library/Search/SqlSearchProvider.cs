@@ -114,7 +114,8 @@ public class SqlSearchProvider : IInternalSearchProvider
             dbQuery = ApplyTypeFilter(dbQuery, query.IncludeItemTypes, query.ExcludeItemTypes);
             dbQuery = ApplyMediaTypeFilter(dbQuery, query.MediaTypes);
             dbQuery = ApplyParentFilter(dbQuery, query.ParentId);
-            dbQuery = ApplyUserAccessFilter(dbContext, dbQuery, query.UserId);
+            dbQuery = ApplyUserAccessFilter(dbContext, dbQuery, query);
+            dbQuery = ExcludeVersionsOfMatchedPrimaries(dbQuery);
 
             // Compute the score in SQL: the ternary translates to a CASE WHEN. CleanName is
             // the pre-normalized (lowercase, diacritic-stripped) form, so we score against it
@@ -193,11 +194,18 @@ public class SqlSearchProvider : IInternalSearchProvider
         return query.Where(e => e.ParentId == pid || e.Parents!.Any(p => p.ParentItemId == pid));
     }
 
+    private static IQueryable<BaseItemEntity> ExcludeVersionsOfMatchedPrimaries(IQueryable<BaseItemEntity> query)
+    {
+        var matched = query;
+        return query.Where(e => e.PrimaryVersionId == null || !matched.Any(p => p.Id == e.PrimaryVersionId));
+    }
+
     private IQueryable<BaseItemEntity> ApplyUserAccessFilter(
         JellyfinDbContext dbContext,
         IQueryable<BaseItemEntity> query,
-        Guid? userId)
+        SearchProviderQuery searchQuery)
     {
+        var userId = searchQuery.UserId;
         if (!userId.HasValue || userId.Value.IsEmpty())
         {
             return query;
@@ -209,8 +217,7 @@ public class SqlSearchProvider : IInternalSearchProvider
             return query;
         }
 
-        var accessFilter = new InternalItemsQuery(user);
-        _libraryManager.ConfigureUserAccess(accessFilter, user);
+        var accessFilter = SearchQueryAccessFilter.Build(user, searchQuery, _libraryManager);
         return _queryHelpers.ApplyAccessFiltering(dbContext, query, accessFilter);
     }
 

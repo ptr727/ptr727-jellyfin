@@ -12,6 +12,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using AsyncKeyedLock;
+using Jellyfin.Extensions;
 using MediaBrowser.Common;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Extensions;
@@ -73,7 +74,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             _serverConfigurationManager = serverConfigurationManager;
         }
 
-        private MemoryStream ConvertSubtitles(
+        internal MemoryStream ConvertSubtitles(
             Stream stream,
             SubtitleInfo inputInfo,
             string outputFormat,
@@ -81,7 +82,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             long endTimeTicks,
             bool preserveOriginalTimestamps)
         {
-            var subtitle = Subtitle.Parse(stream, Path.GetExtension(inputInfo.Path));
+            var subtitle = _subtitleParser.Parse(stream, inputInfo.Format);
 
             FilterEvents(subtitle, startTimeTicks, endTimeTicks, preserveOriginalTimestamps);
 
@@ -163,28 +164,36 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             return (stream, fileInfo);
         }
 
-        private async Task<Stream> GetSubtitleStream(SubtitleInfo fileInfo, CancellationToken cancellationToken)
+        internal async Task<Stream> GetSubtitleStream(SubtitleInfo fileInfo, CancellationToken cancellationToken)
         {
-            if (fileInfo.Protocol == MediaProtocol.Http)
+            if (fileInfo.IsExternal && MediaStream.IsTextFormat(fileInfo.Format))
             {
                 var result = await DetectCharset(fileInfo.Path, cancellationToken).ConfigureAwait(false);
                 var detected = result.Detected;
 
-                if (detected is not null)
-                {
-                    _logger.LogDebug("charset {CharSet} detected for {Path}", detected.EncodingName, fileInfo.Path);
-
-                    using var stream = await _httpClientFactory.CreateClient(NamedClient.Default)
+                var stream = fileInfo.Protocol == MediaProtocol.Http
+                    ? await _httpClientFactory.CreateClient(NamedClient.Default)
                         .GetStreamAsync(new Uri(fileInfo.Path), cancellationToken)
-                        .ConfigureAwait(false);
+                        .ConfigureAwait(false)
+                    : AsyncFile.OpenRead(fileInfo.Path);
 
-                    await using (stream.ConfigureAwait(false))
-                    {
-                        using var reader = new StreamReader(stream, detected.Encoding);
-                        var text = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+                // Short-circuit when the file is already UTF-8/ASCII.
+                if (detected is null
+                    || string.Equals(detected.EncodingName, "utf-8", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(detected.EncodingName, "ascii", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(detected.EncodingName, "us-ascii", StringComparison.OrdinalIgnoreCase))
+                {
+                    return stream;
+                }
 
-                        return new MemoryStream(Encoding.UTF8.GetBytes(text));
-                    }
+                _logger.LogDebug("charset {CharSet} detected for {Path}", detected.EncodingName, fileInfo.Path);
+
+                await using (stream.ConfigureAwait(false))
+                {
+                    using var reader = new StreamReader(stream, detected.Encoding);
+                    var text = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+
+                    return new MemoryStream(Encoding.UTF8.GetBytes(text));
                 }
             }
 
@@ -445,7 +454,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 encodingParam = " -sub_charenc " + encodingParam;
             }
 
-            var args = string.Format(CultureInfo.InvariantCulture, "-y {0} -i \"{1}\" -c:s srt \"{2}\"", encodingParam, inputPath, outputPath);
+            var args = string.Format(CultureInfo.InvariantCulture, "-y {0} -i \"{1}\" -c:s srt \"{2}\"", encodingParam, inputPath.EscapeProcessArgument(), outputPath.EscapeProcessArgument());
 
             await ExtractSubtitlesForFile(
                 inputPath,
@@ -623,7 +632,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                         streamIndex,
                         outputCodec,
                         outputFormatOption,
-                        outputPath);
+                        outputPath.EscapeProcessArgument());
                 }
 
                 await ExtractSubtitlesForFile(inputPath, args, outputPaths, cancellationToken).ConfigureAwait(false);
@@ -640,7 +649,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             List<MediaStream> subtitleStreams,
             CancellationToken cancellationToken)
         {
-            var inputPath = _mediaEncoder.GetInputArgument(mediaSource.Path, mediaSource);
+            var inputPath = _mediaEncoder.GetInputPathArgument(mediaSource.Path, mediaSource);
             var outputPaths = new List<string>();
             var args = string.Format(
                 CultureInfo.InvariantCulture,
@@ -664,7 +673,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 var outputCodec = IsCodecCopyable(subtitleStream.Codec) ? "copy" : "srt";
                 // FFmpeg does not provide an .idx/.sub muxer, so VobSub streams must be written as MKS files.
                 var outputFormatOption = MediaStream.IsVobSubFormat(subtitleStream.Codec) ? " -f matroska" : string.Empty;
-                var streamIndex = EncodingHelper.FindIndex(mediaSource.MediaStreams, subtitleStream);
+                var streamIndex = EncodingHelper.GetSubtitleStreamIndexForFfmpeg(mediaSource, subtitleStream);
 
                 if (streamIndex == -1)
                 {
@@ -681,7 +690,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     streamIndex,
                     outputCodec,
                     outputFormatOption,
-                    outputPath);
+                    outputPath.EscapeProcessArgument());
             }
 
             if (outputPaths.Count > 0)
